@@ -1,0 +1,762 @@
+---
+title: "INFO6105_FinalProject"
+output: html_document
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+# **📘 Introduction**
+
+### **Context & Motivation**
+
+-   GitHub is one of the most widely used platforms for software
+    development, open-source collaboration, and community-driven
+    innovation.
+
+-   “Engagement” on GitHub — measured through watchers, stars, forks,
+    and activity — serves as a key signal of visibility, user interest,
+    and long-term project sustainability.
+
+-   Understanding **what drives engagement** is useful for developers,
+    maintainers, and organizations aiming to build successful
+    repositories.
+
+### **Analytical Goal**
+
+-   The central goal of this project is to quantify how repository
+    characteristics relate to engagement levels across GitHub projects.
+
+-   Specifically, the project aims to identify:
+
+    -   Which **numerical features** (stars, forks, age) most strongly
+        predict engagement.
+
+    -   Whether **programming language** contributes to systematic
+        differences in engagement.
+
+    -   Whether **language and popularity interact** — i.e., does
+        language matter *more* for popular repositories?
+
+    ### **Summary of Approach**
+
+    -   A Kaggle dataset of **215,029 GitHub repositories** was cleaned
+        and processed.
+
+    -   A random sample of **500 repositories** was used to perform
+        formal statistical modeling.
+
+    -   Three analyses were carried out:
+
+        1.  **Multiple Linear Regression** — to quantify predictors of
+            engagement.
+
+        2.  **One-Way ANOVA** — to test differences in engagement by
+            language.
+
+        3.  **Two-Way ANOVA** — to test language, popularity, and
+            interaction effects.
+
+    -   Results contribute to a clearer understanding of what drives
+        community interest on GitHub.
+
+# **Step 1: Import Libraries**
+
+```{r setup, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(janitor)
+library(knitr)
+library(broom)
+library(car)
+library(ggpubr)
+
+data <- read_csv("Data/rgithub_repos.csv")
+data <- clean_names(data)
+glimpse(data)
+
+
+```
+
+# **Step 2: Data Cleaning + Feature Engineering**
+
+```{r}
+## ---- data_cleaning, message=FALSE, warning=FALSE ----
+
+# Remove duplicated rows if they exist
+data <- data %>% distinct()
+
+# Convert character columns to factors where appropriate
+data$language <- as.factor(data$language)
+data$license <- as.factor(data$license)
+data$default_branch <- as.factor(data$default_branch)
+
+# Convert logical columns to numeric (TRUE=1, FALSE=0)
+logical_cols <- sapply(data, is.logical)
+data[logical_cols] <- lapply(data[logical_cols], as.numeric)
+
+# Create repo age in years
+data$created_at <- as.POSIXct(data$created_at, format="%Y-%m-%dT%H:%M:%S")
+data$updated_at <- as.POSIXct(data$updated_at, format="%Y-%m-%dT%H:%M:%S")
+data$repo_age_years <- as.numeric(difftime(Sys.time(), data$created_at, units = "days"))/365
+
+# Replace missing values in numeric columns with median
+num_cols <- sapply(data, is.numeric)
+data[num_cols] <- lapply(data[num_cols], function(x){
+  x[is.na(x)] <- median(x, na.rm=TRUE)
+  x
+})
+
+# Replace missing language values with "Unknown"
+data$language <- fct_explicit_na(data$language, na_level = "Unknown")
+
+# Create language groups for ANOVA
+data$language_group <- ifelse(data$language %in% c("Python", "JavaScript", "TypeScript"),
+                              as.character(data$language),
+                              "Other") %>% 
+  factor()
+
+# Create popularity groups for t-test & regression
+median_stars <- median(data$stars, na.rm=TRUE)
+data$popularity_group <- ifelse(data$stars > median_stars, "High Stars", "Low Stars") %>% 
+  factor()
+
+# Sample 500 rows for analysis
+set.seed(6105)
+sample_data <- data %>% sample_n(500)
+
+glimpse(sample_data)
+
+```
+
+```{r}
+names(sample_data)
+```
+
+```{r eda_summary, message=FALSE, warning=FALSE}
+library(psych)   # for describe()
+
+# Summary statistics (only existing numeric columns)
+describe(sample_data[, c("stars",
+                         "forks",
+                         "watchers",
+                         "issues",
+                         "size",
+                         "repo_age_years")])
+
+```
+
+# **Step 3: Exploratory Data Analysis**
+
+```{r eda_plots, message=FALSE, warning=FALSE}
+# 1. Distribution of Stars
+ggplot(sample_data, aes(stars)) +
+  geom_histogram(bins = 30, fill = "steelblue", alpha = 0.7) +
+  labs(title = "Distribution of Repository Stars",
+       x = "Stars", y = "Count")
+
+# 2. Stars vs Forks (Scatter)
+ggplot(sample_data, aes(stars, forks)) +
+  geom_point(alpha = 0.6, color = "darkred") +
+  labs(title = "Stars vs Forks",
+       x = "Stars", y = "Forks")
+
+# 3. Watchers by Popularity Group
+ggplot(sample_data, aes(popularity_group, watchers, fill = popularity_group)) +
+  geom_boxplot(alpha = 0.7) +
+  labs(title = "Watchers by Popularity Group",
+       x = "Popularity Group", y = "Watchers") +
+  theme(legend.position = "none")
+
+# 4. Stars by Language Group
+ggplot(sample_data, aes(language_group, stars, fill = language_group)) +
+  geom_boxplot(alpha = 0.7) +
+  labs(title = "Stars by Language Group",
+       x = "Language Group", y = "Stars") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+```{r transform_vars, message=FALSE}
+# Log-transform highly skewed variables
+sample_data <- sample_data %>%
+  mutate(
+    log_stars     = log10(stars + 1),
+    log_forks     = log10(forks + 1),
+    log_watchers  = log10(watchers + 1)
+  )
+
+# Quick check
+summary(sample_data[, c("log_stars", "log_forks", "log_watchers", "repo_age_years")])
+
+```
+
+## 2. Analysis 1 – Multiple Linear Regression
+
+Response: log_watchers (proxy for engagement)\
+Predictors: log_stars, log_forks, repo_age_years
+
+```{r mlr_fit, message=FALSE}
+# Keep only complete cases for the regression
+mlr_data <- sample_data %>%
+  select(log_watchers, log_stars, log_forks, repo_age_years) %>%
+  drop_na()
+
+# Fit multiple linear regression
+model_mlr <- lm(log_watchers ~ log_stars + log_forks + repo_age_years,
+                data = mlr_data)
+
+# Coefficients, p-values, etc.
+broom::tidy(model_mlr)
+
+# Overall fit (R², adj R², F-test)
+broom::glance(model_mlr)
+```
+
+```{r}
+## ---- mlr_diagnostics, message=FALSE, warning=FALSE ----
+library(ggplot2)
+
+# Extract model data
+mlr_data$predicted <- predict(model_mlr)
+mlr_data$residuals <- resid(model_mlr)
+
+# 1. Residuals vs Fitted (checks linearity & equal variance)
+ggplot(mlr_data, aes(x = predicted, y = residuals)) +
+  geom_point(alpha = 0.5, color = "steelblue") +
+  geom_hline(yintercept = 0, color = "red") +
+  labs(title = "Residuals vs Fitted",
+       x = "Fitted Values",
+       y = "Residuals")
+
+# 2. Q-Q Plot (normality of residuals)
+ggplot(mlr_data, aes(sample = residuals)) +
+  stat_qq() +
+  stat_qq_line(color = "red") +
+  labs(title = "Q-Q Plot of Residuals")
+
+# 3. Scale-Location Plot (homoscedasticity)
+ggplot(mlr_data, aes(x = predicted, y = sqrt(abs(residuals)))) +
+  geom_point(alpha = 0.5, color = "darkgreen") +
+  geom_smooth(se = FALSE) +
+  labs(title = "Scale-Location Plot",
+       x = "Fitted Values",
+       y = "√|Residuals|")
+```
+
+## 3. Analysis 2 – One-Way ANOVA
+
+Research Question:\
+Do average engagement levels (log_watchers) differ across primary
+language groups for popular GitHub repositories?
+
+Response: log_watchers (proxy for engagement)\
+Factor: language_group (JavaScript, Python, TypeScript, Other)
+
+Null hypothesis (H₀): Mean log_watchers is the same for all language
+groups.\
+Alternative hypothesis (H₁): At least one language group has a different
+mean log_watchers.
+
+```{r anova1_descriptives, message=FALSE, warning=FALSE}
+# Keep only rows with both variables present
+anova1_data <- sample_data %>%
+  drop_na(language_group, log_watchers)
+
+# Summary statistics by language group
+anova1_summary <- anova1_data %>%
+  group_by(language_group) %>%
+  summarise(
+    n = n(),
+    mean_log_watchers = mean(log_watchers),
+    sd_log_watchers   = sd(log_watchers)
+  )
+
+knitr::kable(anova1_summary, digits = 3,
+             caption = "Summary statistics of log_watchers by language group")
+
+```
+
+🔹 3.1 **Descriptive Stats & Boxplot**
+
+```{r anova1_boxplot, message=FALSE, warning=FALSE}
+# Boxplot of engagement by language
+ggplot(anova1_data,
+       aes(x = language_group, y = log_watchers, fill = language_group)) +
+  geom_boxplot(alpha = 0.7) +
+  labs(title = "Engagement (log_watchers) by Language Group",
+       x = "Language Group",
+       y = "log(Watchers)") +
+  theme(legend.position = "none")
+```
+
+🔹 3.2 **One-Way ANOVA**
+
+```{r anova1_model, message=FALSE, warning=FALSE}
+# Fit one-way ANOVA: engagement ~ language_group
+fit_aov1 <- aov(log_watchers ~ language_group, data = anova1_data)
+
+# ANOVA table
+broom::tidy(fit_aov1)
+```
+
+## **Interpretation of One-Way ANOVA**
+
+The one-way ANOVA tested whether average engagement levels (measured
+using *log-transformed watchers*) differ across programming language
+groups. Results indicate a **statistically significant effect of
+language group on engagement**, **F(3, 496) = 4.76, p = 0.0028**. This
+means that *at least one* language group has a different average
+log_watchers value compared to the others. In simpler terms, **the
+popularity of repositories differs depending on the primary programming
+language.**
+
+🔹 3.3 **Tukey HSD Post-hoc Test**s
+
+```{r anova1_tukey, message=FALSE, warning=FALSE}
+tukey_aov1 <- TukeyHSD(fit_aov1)
+
+# Full Tukey output
+tukey_aov1
+
+# Tidy version (nice for tables)
+tukey_tidy <- broom::tidy(tukey_aov1)
+knitr::kable(tukey_tidy, digits = 3,
+             caption = "Tukey HSD pairwise comparisons for language_group")
+```
+
+## **Tukey HSD Interpretation**
+
+Because the ANOVA was significant, we performed Tukey HSD post-hoc tests
+to identify which pairs differ.
+
+Key findings:
+
+-   **Python vs JavaScript** showed one of the strongest significant
+    differences
+
+    (p ≈ 0.0014), indicating that Python repositories have **lower**
+    engagement than JavaScript repositories on average.
+
+-   **Python vs Other** was also statistically significant (p ≈ 0.0379),
+    suggesting Python tends to have lower engagement than the “Other”
+    category.
+
+-   **All other pairwise comparisons** (e.g., TypeScript vs JavaScript,
+    TypeScript vs Python, etc.)
+
+    were **not statistically significant**, meaning their mean
+    engagement levels are not reliably different.
+
+Overall, **JavaScript repositories generally exhibit higher
+engagement**, while **Python tends to show lower engagement** within
+this sample.
+
+🔹 3.4 Effect Size (η²)
+
+```{r anova1_effect_size, message=FALSE, warning=FALSE}
+anova_table <- broom::tidy(fit_aov1)
+
+# Total SS = sum of all sums of squares
+ss_total <- sum(anova_table$sumsq)
+
+# Eta-squared for language_group
+eta2_language <- anova_table$sumsq[anova_table$term == "language_group"] / ss_total
+eta2_language
+```
+
+## **Effect Size Interpretation (η²)**
+
+The effect size (eta-squared) was:
+
+**η² = 0.0279**
+
+This indicates that **only about 2.8% of the variance** in engagement
+(log_watchers) is explained by the programming language used.
+
+According to conventional effect-size guidelines:
+
+-   0.01 = small
+
+-   0.06 = medium
+
+-   0.14 = large
+
+This effect size is **small**, meaning that although language group
+matters statistically, it is **not a strong predictor** of engagement.
+
+Most variation in engagement is driven by other factors (e.g., stars,
+forks, repo age).
+
+🔹 3.5 Assumption Checks (Normality & Equal Variance)
+
+```{r anova1_diagnostics, message=FALSE, warning=FALSE}
+# Data frame of fitted values and residuals
+aov1_diag <- data.frame(
+  fitted     = fitted(fit_aov1),
+  residuals  = resid(fit_aov1)
+)
+
+# 1. Residuals vs Fitted (check equal variances & linearity of group means)
+ggplot(aov1_diag, aes(x = fitted, y = residuals)) +
+  geom_point(alpha = 0.6) +
+  geom_hline(yintercept = 0, color = "red") +
+  labs(title = "ANOVA 1: Residuals vs Fitted",
+       x = "Fitted Values",
+       y = "Residuals")
+
+# 2. Q-Q Plot (normality of residuals)
+ggplot(aov1_diag, aes(sample = residuals)) +
+  stat_qq(alpha = 0.6) +
+  stat_qq_line(color = "red") +
+  labs(title = "ANOVA 1: Q-Q Plot of Residuals")
+
+# 3. Scale-Location (homoscedasticity)
+ggplot(aov1_diag, aes(x = fitted, y = sqrt(abs(residuals)))) +
+  geom_point(alpha = 0.6) +
+  geom_smooth(se = FALSE) +
+  labs(title = "ANOVA 1: Scale-Location Plot",
+       x = "Fitted Values",
+       y = "√|Residuals|")
+
+# 4. Levene's test for equal variances
+car::leveneTest(log_watchers ~ language_group, data = anova1_data)
+```
+
+It appears that residuals are extremely close to zero due to perfect
+correlation among predictors, therefore diagnostic plots appear flat.
+The ANOVA residual plots look normal and Levene’s test shows significant
+differences.
+
+## **Assumptions Check Interpretation**
+
+### **Normality of Residuals**
+
+The Q-Q plot shows points that generally follow the diagonal line,
+though with some deviations at the extremes.
+
+Given the large sample size (n = 500), these deviations are not serious.
+
+Normality is **reasonably satisfied**.
+
+### **Homogeneity of Variance**
+
+Levene’s Test returned:
+
+**F = 5.72, p = 0.00074**
+
+Since **p \< 0.05**, the variances across language groups are **not
+equal**.
+
+This violates the homogeneity assumption of ANOVA.
+
+However, ANOVA is fairly robust to variance inequality when group sizes
+are similar and sample size is large — which is true for this dataset.
+
+Thus, results remain interpretable but should be described as
+**cautiously interpreted**.
+
+### **Residuals vs Fitted & Scale-Location**
+
+-   Residuals appear very close to zero because the transformed
+    variables are highly correlated.
+
+-   The Scale-Location plot does not show strong patterns of
+    heteroscedasticity.
+
+-   No major violations of linearity appear.
+
+Overall, **assumptions are reasonably satisfied**, with the exception of
+unequal variances.
+
+# **4. Analysis 3: Two-Way ANOVA**
+
+**Research Question:**
+
+Do engagement levels differ by **programming language**, by
+**popularity**, and is there an **interaction** between them?
+
+### **▣ Factors**
+
+-   **Factor A:** language_group (4 levels)
+
+-   **Factor B:** popularity_group (High Stars / Low Stars)
+
+-   **Interaction:** A × B
+
+-   **Response:** log_watchers
+
+    # **🔹4.1 Create Dataset**
+
+    ```{r}
+    anova2_data <- sample_data %>%
+      drop_na(language_group, popularity_group, log_watchers)
+    ```
+
+# **🔹 4.2 Interaction Plot**
+
+```{r}
+interaction.plot(
+  x.factor = anova2_data$language_group,
+  trace.factor = anova2_data$popularity_group,
+  response = anova2_data$log_watchers,
+  fun = mean,
+  type = "b",
+  col = c("red", "blue"),
+  pch = c(19, 17),
+  xlab = "Language Group",
+  ylab = "Mean log(Watchers)",
+  trace.label = "Popularity Group",
+  main = "Interaction Plot: Language × Popularity"
+)
+```
+
+# **🔹4.3 Two-Way ANOVA Model**
+
+```{r}
+fit_aov2 <- aov(
+  log_watchers ~ language_group * popularity_group,
+  data = anova2_data
+)
+
+anova2_results <- broom::tidy(fit_aov2)
+knitr::kable(anova2_results, digits = 3,
+             caption = "Two-Way ANOVA Table")
+```
+
+# **🔹4.4 Interpretation**
+
+The two-way ANOVA revealed **three clear findings**:
+
+### **1. Main Effect of Programming Language — Significant**
+
+Language group had a **statistically significant effect** on engagement
+(p \< .001).
+
+Some languages consistently attract more watchers than others, even
+after controlling for popularity.
+
+In particular, JavaScript and TypeScript tend to draw higher engagement
+than Python.
+
+### **2. Main Effect of Popularity — Highly Significant**
+
+Popularity group (High Stars vs Low Stars) showed an **extremely strong
+effect** (p \< .001).
+
+High-star repositories receive substantially higher engagement
+regardless of language.
+
+This confirms that **popularity is the dominant driver of watcher
+counts**.
+
+### **3. Interaction Effect — Significant**
+
+The interaction between language and popularity was **significant** (p =
+.012), meaning:
+
+> **The influence of programming language on engagement depends on
+> whether the repository is popular.**
+
+From the interaction plot:
+
+-   Among **high-star** repositories, language differences are
+    noticeable
+
+    (JavaScript \> Other \> Python).
+
+-   Among **low-star** repositories, engagement is uniformly low across
+    all languages.
+
+Thus, language matters **only when repositories are already popular**.
+
+# **🔹4.5 Effect Size (partial η²)**
+
+```{r}
+## ---- anova2_effect_size, message=FALSE, warning=FALSE ----
+anova2_raw <- summary(fit_aov2)
+
+# Extract SS values
+ss_language   <- anova2_raw[[1]]["language_group", "Sum Sq"]
+ss_popularity <- anova2_raw[[1]]["popularity_group", "Sum Sq"]
+ss_interaction <- anova2_raw[[1]]["language_group:popularity_group", "Sum Sq"]
+ss_residuals  <- anova2_raw[[1]]["Residuals", "Sum Sq"]
+
+# Partial eta-squared
+eta2_language_partial   <- ss_language / (ss_language + ss_residuals)
+eta2_popularity_partial <- ss_popularity / (ss_popularity + ss_residuals)
+eta2_interaction_partial <- ss_interaction / (ss_interaction + ss_residuals)
+
+eta2_language_partial
+eta2_popularity_partial
+eta2_interaction_partial
+```
+
+Popularity has a **dominant influence** on engagement, explaining **over
+53%** of the variance in log-watchers. far more than any other factor.
+
+The interaction between language and popularity explains **\~2%** of the
+variance, indicating a **weak but noticeable interaction pattern**.
+
+The effect of language alone is minimal, aligning with earlier findings
+that language is not a major determinant of engagement once popularity
+is accounted for.
+
+# **🔹4.6 Post-Hoc Tests**
+
+```{r}
+## ---- anova2_posthoc, message=FALSE, warning=FALSE ----
+
+# Split data by popularity group
+high_data <- subset(anova2_data, popularity_group == "High Stars")
+low_data  <- subset(anova2_data, popularity_group == "Low Stars")
+
+# Tukey per popularity level
+tukey_high <- TukeyHSD(aov(log_watchers ~ language_group, data = high_data))
+tukey_low  <- TukeyHSD(aov(log_watchers ~ language_group, data = low_data))
+
+tukey_high
+tukey_low
+```
+
+Post-hoc tests show that **language differences only appear in the top
+half of repositories** (High Stars group), and even there, the effect is
+small.
+
+Among low-engagement projects, **all languages perform similarly**,
+confirming that language matters little when a project is not already
+popular.
+
+# **🔹4.7 Assumption Checks**
+
+### **Residuals + Fitted**
+
+```{r}
+aov2_diag <- data.frame(
+  fitted = fitted(fit_aov2),
+  residuals = resid(fit_aov2)
+)
+
+ggplot(aov2_diag, aes(fitted, residuals)) +
+  geom_point(alpha = 0.6) +
+  geom_hline(yintercept = 0, color="red") +
+  labs(title="Two-Way ANOVA: Residuals vs Fitted")
+```
+
+No major violations of linearity. Slight heteroscedasticity but
+acceptable with n = 500.
+
+### **Normal Q-Q**
+
+```{r}
+ggplot(aov2_diag, aes(sample=residuals)) +
+  stat_qq() +
+  stat_qq_line(color="red") +
+  labs(title="Two-Way ANOVA: Q-Q Plot")
+```
+
+Residuals are approximately normal. Minor tail deviations do not
+threaten ANOVA validity with large samples.
+
+### **Scale-Location**
+
+```{r}
+ggplot(aov2_diag, aes(fitted, sqrt(abs(residuals)))) +
+  geom_point(alpha=0.6) +
+  geom_smooth(se=FALSE) +
+  labs(title="Two-Way ANOVA: Scale-Location Plot")
+```
+
+Mild heteroscedasticity is present, but ANOVA is robust given balanced
+groups and sample size.
+
+### **Levene’s Test**
+
+```{r}
+leveneTest(log_watchers ~ language_group * popularity_group, 
+           data = anova2_data)
+```
+
+Assumption of equal variance is violated.
+
+However, with:
+
+-   large sample (n = 500),
+
+-   balanced groups,
+
+-   robust ANOVA models,
+
+the results remain valid but should be described as **interpreted with
+caution**.
+
+# **Summary & Insights**
+
+This project examined engagement patterns across GitHub repositories
+using a Kaggle dataset of over 215,000 entries, with a random sample of
+500 used for statistical analyses. Engagement was measured using
+log-transformed watcher counts, and the study explored how repository
+features—particularly stars, forks, age, and programming language—shape
+engagement.
+
+### **Multiple Linear Regression Findings**
+
+The regression analysis revealed that **stars are by far the strongest
+predictor of engagement**, showing a near-perfect linear relationship
+with log-watchers. Forks and repository age added minimal explanatory
+power once stars were included, highlighting significant
+multicollinearity among GitHub popularity indicators (stars, forks,
+watchers). The model’s extremely high R² value reflects this overlap,
+reinforcing that engagement on GitHub is overwhelmingly tied to existing
+popularity signals rather than to structural attributes like age.
+
+### **One-Way ANOVA Results (Language Effects)**
+
+A one-way ANOVA tested whether engagement varied across programming
+language groups. Results showed a **statistically significant but modest
+difference** in engagement by language (F(3, 496) = 4.76, p = 0.0028).
+
+Post-hoc Tukey comparisons indicated:
+
+-   **JavaScript \> Python**
+
+-   **Other \> Python**
+
+However, the effect size was small (η² = 0.028), meaning language
+explained only about **3% of the variation** in engagement. Thus, while
+statistically detectable, the practical importance of language is
+limited.
+
+### **Assumption Checks**
+
+-   **Normality:** Residuals were approximately normal.
+
+-   **Equal Variance:** Levene’s test indicated unequal variances (p \<
+    0.001), but with balanced groups and a large sample size, ANOVA
+    results remain reliable.
+
+-   **Linearity & Homoscedasticity:** Plots showed acceptable patterns
+    with no major violations.
+
+### **Overall Insights**
+
+Although programming language shows minor statistical differences, **its
+practical impact on engagement is minimal**. The dominant driver of
+engagement is **popularity itself**, primarily captured through stars.
+Repositories that have already accumulated attention regardless of
+language tend to attract more watchers, while forks and age play
+comparatively small roles.
+
+## **Final Conclusion**
+
+Overall, the analysis demonstrates that **GitHub engagement is driven
+far more by existing popularity than by technical characteristics of a
+project**. Stars provide a strong and direct signal of community
+interest, making them the clearest predictor of engagement.
+
+Programming language contributes only modestly to engagement patterns,
+suggesting that developers should focus less on language choice and more
+on building visibility, maintaining activity, and attracting early
+adoption.
+
+```{r}
+sessionInfo()
+```

@@ -1,0 +1,11 @@
+# R / RStudio
+.Rproj.user/
+.Rhistory
+.RData
+.Ruserdata
+
+# Data (do not upload large datasets)
+Data/*.csv
+
+# macOS
+.DS_Store
